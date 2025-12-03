@@ -1,105 +1,170 @@
 import streamlit as st
 import google.generativeai as genai
+from pokemontcgsdk import Card
+from pokemontcgsdk import RestClient
 from gtts import gTTS
+from pydub import AudioSegment
 import tempfile
 import os
+import json
 
-# --- CONFIGURATIE ---
-# LET OP: Zet je API key hieronder tussen de haakjes!
-api_key = "AIzaSyC9o4qtyqQhRaRlUPTQn9Fy-Oni2L3xINI"
+# --- 1. CONFIGURATIE ---
+# Vul hier je keys in!
+GOOGLE_API_KEY = "JOUW_GOOGLE_API_KEY_HIER"
+TCG_API_KEY = "d26a9544-873c-4f6d-ba7b-37fa05ad47c9"  # Optioneel, mag ook leeg als je geen key hebt, maar beter met.
 
-genai.configure(api_key=api_key)
+genai.configure(api_key=GOOGLE_API_KEY)
+RestClient.configure(api_key=TCG_API_KEY)
 
-# Instellingen voor de pagina (zodat het op mobiel past)
-st.set_page_config(layout="wide", page_title="Gonk Scanner")
+st.set_page_config(layout="wide", page_title="Holocron Scanner")
 
-# CSS om de knop ENORM te maken (zodat je neefje niet kan missen)
+# CSS: Verberg alles behalve de enorme 'blinde' knop
 st.markdown("""
 <style>
-    /* Maak de camera input en knop onzichtbaar maar wel klikbaar of positioneer ze */
-    .stCameraInput {
-        width: 100%;
-    }
+    .stApp {background-color: black;}
+    div[data-testid="stCameraInput"] {width: 100%;}
     div[data-testid="stCameraInput"] button {
-        height: 300px; /* Enorme knop */
-        width: 100%;
-        background-color: transparent;
-        border: 2px solid red; /* Tijdelijk rood om te mikken, later weg */
-        color: transparent;
+        height: 400px; 
+        width: 100%; 
+        opacity: 0.1; /* Bijna onzichtbaar, maar wel klikbaar */
+        border: 5px solid red; /* Handig voor jou om te richten */
     }
-    /* Verberg header en footer */
-    header {visibility: hidden;}
-    footer {visibility: hidden;}
+    header, footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
 
-# --- FUNCTIES ---
+# --- 2. FUNCTIES ---
 
-def get_c3po_analysis(image_data):
-    """Stuurt foto naar Gemini en vraagt om C-3PO response + prijs."""
+def identify_card_with_gemini(image):
+    """Gebruikt Vision AI om ALLEEN de naam en het nummer te lezen."""
     model = genai.GenerativeModel('gemini-1.5-flash')
 
+    # We dwingen JSON output af voor stabiliteit
     prompt = """
-    Je bent C-3PO uit Star Wars. Je bent beleefd maar altijd een beetje bezorgd.
-    Bekijk deze Pokémon kaart. 
-    1. Identificeer de Pokémon en de kaart set.
-    2. Schat de waarde in Euro's (schatting is prima).
-    3. Geef antwoord als C-3PO tegen een jong kind. Zeg iets over de 'power level' of dat de kaart zeldzaam is.
-
-    Houd het kort (maximaal 3 zinnen). Begin met een typische C-3PO uitspraak.
-    Eindig met de geschatte waarde duidelijk te noemen.
+    Bekijk deze Pokemon kaart. Ik heb de exacte naam en het kaartnummer (bijv. 4/102) nodig.
+    Geef antwoord in puur JSON formaat: {"name": "Charizard", "number": "4", "set_id": "base1"}
+    Als je het niet ziet, geef {"error": "niet zichtbaar"}.
     """
-
     try:
-        # Streamlit camera input geeft een BytesIO object
-        import PIL.Image
-        img = PIL.Image.open(image_data)
-
-        response = model.generate_content([prompt, img])
-        return response.text
-    except Exception as e:
-        return f"Oh dear, my sensors are malfunctioning. Error: {e}"
+        response = model.generate_content([prompt, image])
+        # Schoonmaken van de output (soms doet Gemini markdown ```json eromheen)
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except:
+        return {"error": "Parse error"}
 
 
-def speak_text(text):
-    """Zet tekst om naar spraak (C-3PO stem benadering is lastig, we doen gewoon NL/EN)."""
+def get_real_price(name, number):
+    """Haalt de ECHTE prijs op via de SDK."""
     try:
-        # We gebruiken 'en' voor een Engels accent, of 'nl' als je wilt dat hij NL spreekt.
-        # C-3PO spreekt vaak Engels, maar voor je neefje is NL misschien leuker?
-        # Laten we NL doen met een 'robot' sausje is lastig, gTTS is vrij standaard.
-        tts = gTTS(text=text, lang='nl')
+        # Zoek query: naam en nummer is vaak het nauwkeurigst
+        query = f'name:"{name}" number:"{number}"'
+        cards = Card.where(q=query)
 
-        # Tijdelijk bestand
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-            tts.save(fp.name)
-            return fp.name
+        if len(cards) > 0:
+            # Pak de eerste match
+            c = cards[0]
+            # Probeer marktprijs te vinden, fallback naar mid prijs
+            if c.tcgplayer and c.tcgplayer.prices:
+                # Prioriteit: Holofoil -> Normal -> Reverse Holo
+                prices = c.tcgplayer.prices
+                if hasattr(prices, 'holofoil') and prices.holofoil:
+                    return prices.holofoil.market or prices.holofoil.mid, c.name
+                if hasattr(prices, 'normal') and prices.normal:
+                    return prices.normal.market or prices.normal.mid, c.name
+                if hasattr(prices, 'reverseHolofoil') and prices.reverseHolofoil:
+                    return prices.reverseHolofoil.market or prices.reverseHolofoil.mid, c.name
+
+            return 0.0, c.name
+        else:
+            return None, None
     except Exception as e:
-        st.error(f"Audio error: {e}")
-        return None
+        print(f"SDK Error: {e}")
+        return None, None
 
 
-# --- MAIN APP ---
+def generate_c3po_speech_text(card_name, price):
+    """Laat Gemini de C-3PO tekst verzinnen."""
+    model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Omdat het scherm kapot is, bouwen we een 'blinde' interface.
-# De app wacht eigenlijk alleen op de camera input.
+    # Als prijs 0 of None is
+    val_text = f"ongeveer {price} euro" if price else "onbekend"
 
-img_file_buffer = st.camera_input("SCANNER_ACTIVATED", label_visibility="hidden")
+    prompt = f"""
+    Je bent C-3PO. Je spreekt NEDERLANDS.
+    Je hebt net een kaart gescand: {card_name}. Waarde: {val_text}.
 
-if img_file_buffer is not None:
-    # 1. Feedback dat hij bezig is (voor jou via scrcpy te zien)
-    st.write("Processing artifact...")
+    Opdracht:
+    1. Reageer geschrokken of bezorgd (typisch C-3PO).
+    2. Noem de Pokémon naam en de waarde.
+    3. Zeg tegen 'Meester Jelle's neefje' (noem geen naam) dat hij voorzichtig moet zijn.
+    4. Houd het kort (max 3 zinnen).
+    """
+    response = model.generate_content(prompt)
+    return response.text
 
-    # 2. AI Analyse
-    result_text = get_c3po_analysis(img_file_buffer)
 
-    # 3. Print resultaat (voor debug)
-    st.success(result_text)
+def make_it_sound_like_c3po(text):
+    """Maakt audio en vervormt deze naar robot-achtig."""
+    # 1. Basis TTS (Nederlands)
+    tts = gTTS(text=text, lang='nl')
 
-    # 4. Spreek resultaat uit
-    audio_file = speak_text(result_text)
-    if audio_file:
-        # Autoplay proberen we te forceren
-        st.audio(audio_file, format="audio/mp3", autoplay=True)
-        # Clean up file later
-        os.unlink(audio_file)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+        tts.save(fp.name)
+        orig_file = fp.name
+
+    # 2. Audio manipulatie met Pydub (Pitch & Speed)
+    sound = AudioSegment.from_mp3(orig_file)
+
+    # C-3PO praat sneller en iets hoger
+    # Speedup (hacky way: frame rate manipulatie)
+    new_sample_rate = int(sound.frame_rate * 1.25)  # 25% sneller
+    sound_speedy = sound._spawn(sound.raw_data, overrides={'frame_rate': new_sample_rate})
+    sound_speedy = sound_speedy.set_frame_rate(44100)  # Reset naar standaard
+
+    # Pitch shift (beetje omhoog voor robot effect)
+    # Pydub heeft geen native pitch shift zonder speed change,
+    # maar de speed change hierboven doet ook pitch omhoog!
+    # Dus we zijn er eigenlijk al. 2 vliegen in 1 klap.
+
+    processed_file = orig_file.replace(".mp3", "_c3po.mp3")
+    sound_speedy.export(processed_file, format="mp3")
+
+    return processed_file
+
+
+# --- 3. MAIN APP FLOW ---
+
+# Camera input (onzichtbare knop, schermvullend)
+img_buffer = st.camera_input("Scan", label_visibility="hidden")
+
+if img_buffer:
+    st.write("Analyseren...")  # Feedback voor jou op scrcpy
+
+    import PIL.Image
+
+    img = PIL.Image.open(img_buffer)
+
+    # Stap 1: Wat is het?
+    id_data = identify_card_with_gemini(img)
+
+    if "error" not in id_data:
+        name = id_data.get("name")
+        number = id_data.get("number")
+
+        # Stap 2: Wat kost het?
+        price, full_name = get_real_price(name, number)
+
+        # Stap 3: Wat zegt C-3PO?
+        c3po_text = generate_c3po_speech_text(full_name or name, price)
+        st.success(c3po_text)  # Tekst feedback
+
+        # Stap 4: Audio genereren
+        audio_path = make_it_sound_like_c3po(c3po_text)
+
+        # Stap 5: Afspelen
+        st.audio(audio_path, format='audio/mp3', autoplay=True)
+
+    else:
+        st.error("Oh jee, mijn sensoren zien niets!")
